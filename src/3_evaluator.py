@@ -37,7 +37,7 @@ llm = ChatOllama(
 
 evaluation_prompt = ChatPromptTemplate.from_template(
     """
-You are a  document relevance evaluator.
+You are a document relevance evaluator.
 
 Evaluate only the actual document provided below.
 
@@ -94,7 +94,9 @@ def get_score(value, field_name):
     """Validate and return a numeric score between 0 and 1."""
 
     if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be a number, not a boolean")
+        raise ValueError(
+            f"{field_name} must be a number, not a boolean"
+        )
 
     if not isinstance(value, (int, float)):
         raise ValueError(f"{field_name} must be numeric")
@@ -138,14 +140,13 @@ def evaluate_document(question, document):
         })
 
         response = llm.invoke(prompt)
-
         raw_response = response.content.strip()
 
         print("\n--- RAW OLLAMA RESPONSE ---")
         print(raw_response)
         print("---------------------------")
 
-        # Handle responses wrapped in Markdown fences
+        # Handle Markdown code fences
         if raw_response.startswith("```"):
             raw_response = raw_response.split(
                 "\n", 1
@@ -154,7 +155,9 @@ def evaluate_document(question, document):
         result = json.loads(raw_response)
 
         if not isinstance(result, dict):
-            raise ValueError("Ollama response must be a JSON object")
+            raise ValueError(
+                "Ollama response must be a JSON object"
+            )
 
         # Validate scores
         relevance = get_score(
@@ -262,7 +265,7 @@ def summarize_evaluation(results):
 
         counts[label] += 1
 
-    # Keep only successfully evaluated documents
+    # Exclude evaluation failures from aggregation
     valid_results = [
         result
         for result in results
@@ -286,7 +289,6 @@ def summarize_evaluation(results):
         evidence_score = None
 
     else:
-        # Aggregate evidence across valid documents
         coverage = max(
             result["coverage"]
             for result in valid_results
@@ -333,25 +335,38 @@ def main():
         print("Question cannot be empty.")
         return
 
+    # Load and split documents once
+    source_documents = retriever.load_documents()
+    chunks = retriever.split_documents(source_documents)
+
+    # Initialize embeddings and ChromaDB
+    embeddings = retriever.get_embeddings()
+
     vector_store = retriever.create_vector_store(
-        retriever.split_documents(
-            retriever.load_documents()
-        ),
-        retriever.get_embeddings()
+        chunks,
+        embeddings
     )
 
+    # Build BM25 keyword index
+    bm25_index = retriever.create_bm25_index(chunks)
+
+    # Hybrid retrieval: BM25 + vector search + RRF
     documents = retriever.retrieve_documents(
-        vector_store,
-        question
+        vector_store=vector_store,
+        query=question,
+        chunks=chunks,
+        bm25_index=bm25_index
     )
 
     print(f"\nRetrieved {len(documents)} documents.")
 
+    # Evaluate retrieved documents
     results = evaluate_documents(
         question,
         documents
     )
 
+    # Summarize evaluation
     summary = summarize_evaluation(results)
 
     print("\n--- Overall Evaluation ---")
