@@ -1,17 +1,15 @@
-# Read the extracted JSONL.
-# Split pages into overlapping chunks.
-# Convert each chunk into an embedding.
-# Store the embeddings and metadata in ChromaDB
 
-import json 
-from pathlib import Path 
+import json
+from pathlib import Path
+import re
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+
 
 # Project paths
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,12 +24,15 @@ CHROMA_DIR = ROOT / "data" / "chroma_db"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
 
-TOP_K = 4
+TOP_K = 7
 
 COLLECTION_NAME = "research_documents"
+
+# Reciprocal Rank Fusion constant
+RRF_K = 60
 
 
 # -----------------------------
@@ -45,8 +46,6 @@ def load_documents():
 
     with INPUT_FILE.open("r", encoding="utf-8") as file:
         for line in file:
-            import json
-
             page = json.loads(line)
 
             documents.append(
@@ -101,7 +100,7 @@ def get_embeddings():
 # -----------------------------
 
 def create_vector_store(chunks, embeddings):
-    """Store document chunks in persistent ChromaDB."""
+    """Create or load the persistent ChromaDB collection."""
 
     vector_store = Chroma(
         collection_name=COLLECTION_NAME,
@@ -109,36 +108,161 @@ def create_vector_store(chunks, embeddings):
         persist_directory=str(CHROMA_DIR)
     )
 
-    vector_store.add_documents(chunks)
+    # Add chunks only when the collection is empty.
+    collection = vector_store._collection
 
-    print(f"Stored {len(chunks)} chunks in ChromaDB.")
+    if collection.count() == 0:
+        vector_store.add_documents(chunks)
+        print(f"Stored {len(chunks)} chunks in ChromaDB.")
+    else:
+        print(
+            f"Loaded existing ChromaDB collection "
+            f"with {collection.count()} chunks."
+        )
 
     return vector_store
 
 
 # -----------------------------
-# 5. Retrieve relevant documents
+# 5. BM25 keyword search
 # -----------------------------
 
-def retrieve_documents(vector_store, query, top_k=TOP_K):
-    """Retrieve the most relevant chunks for a query."""
+def tokenize_text(text):
+    """Convert text into lowercase word tokens."""
 
-    results = vector_store.similarity_search(
-        query,
-        k=top_k
+    return re.findall(r"\w+", text.lower())
+
+
+def create_bm25_index(chunks):
+    """Create a BM25 index from the current document chunks."""
+
+    tokenized_chunks = [
+        tokenize_text(chunk.page_content)
+        for chunk in chunks
+    ]
+
+    return BM25Okapi(tokenized_chunks)
+
+
+def bm25_search(bm25_index, chunks, query, top_k=TOP_K):
+    """Retrieve chunks using BM25 keyword matching."""
+
+    query_tokens = tokenize_text(query)
+
+    scores = bm25_index.get_scores(query_tokens)
+
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True
     )
+
+    results = []
+
+    for index in ranked_indices:
+        if scores[index] <= 0:
+            continue
+
+        results.append(chunks[index])
+
+        if len(results) >= top_k:
+            break
 
     return results
 
 
 # -----------------------------
-# 6. Run a retrieval test
+# 6. Reciprocal Rank Fusion
+# -----------------------------
+
+def reciprocal_rank_fusion(
+    bm25_results,
+    vector_results,
+    top_k=TOP_K
+):
+    """Combine BM25 and vector rankings using RRF."""
+
+    scores = {}
+    documents = {}
+
+    result_lists = [
+        bm25_results,
+        vector_results
+    ]
+
+    for result_list in result_lists:
+        for rank, doc in enumerate(result_list, start=1):
+
+            # Use content + metadata to identify the same chunk.
+            key = (
+                doc.page_content,
+                doc.metadata.get("source"),
+                doc.metadata.get("page")
+            )
+
+            scores[key] = scores.get(key, 0) + (
+                1 / (RRF_K + rank)
+            )
+
+            documents[key] = doc
+
+    ranked_keys = sorted(
+        scores,
+        key=lambda key: scores[key],
+        reverse=True
+    )
+
+    return [
+        documents[key]
+        for key in ranked_keys[:top_k]
+    ]
+
+
+# -----------------------------
+# 7. Hybrid retrieval
+# -----------------------------
+
+def retrieve_documents(
+    vector_store,
+    query,
+    chunks,
+    bm25_index,
+    top_k=TOP_K
+):
+    """Retrieve and fuse BM25 and vector search results."""
+
+    # Keyword-based retrieval
+    bm25_results = bm25_search(
+        bm25_index,
+        chunks,
+        query,
+        top_k=top_k
+    )
+
+    # Semantic vector retrieval
+    vector_results = vector_store.similarity_search(
+        query,
+        k=top_k
+    )
+
+    # Combine both rankings
+    hybrid_results = reciprocal_rank_fusion(
+        bm25_results,
+        vector_results,
+        top_k=top_k
+    )
+
+    return hybrid_results
+
+
+# -----------------------------
+# 8. Run a retrieval test
 # -----------------------------
 
 def main():
     query = input("\nEnter your question: ")
-    documents = load_documents()
 
+    documents = load_documents()
     chunks = split_documents(documents)
 
     embeddings = get_embeddings()
@@ -148,17 +272,19 @@ def main():
         embeddings
     )
 
-    
+    # Build the BM25 index from the loaded chunks
+    bm25_index = create_bm25_index(chunks)
 
     results = retrieve_documents(
         vector_store,
-        query
+        query,
+        chunks,
+        bm25_index
     )
 
-    print("\n--- Retrieved Documents ---")
+    print("\n--- Hybrid Search Results ---")
 
     for i, doc in enumerate(results, start=1):
-
         print(f"\nDocument {i}")
         print(f"Source: {doc.metadata.get('source')}")
         print(f"Page: {doc.metadata.get('page')}")
