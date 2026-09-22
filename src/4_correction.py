@@ -1,47 +1,96 @@
+
 # src/4_correction.py
 
 from typing import Any, Dict, List
 
 
+# -----------------------------
 # Thresholds
+# -----------------------------
+
 RELEVANCE_THRESHOLD = 0.60
 COVERAGE_THRESHOLD = 0.60
 EVIDENCE_THRESHOLD = 0.60
 
 
-def _get_score(result: Dict[str, Any], key: str) -> float:
-    """
-    Safely extract a numeric score from an evaluator result.
-    """
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def _get_score(
+    result: Dict[str, Any],
+    key: str
+) -> float:
+    """Safely extract a valid numeric score."""
+
+    value = result.get(key)
+
+    if isinstance(value, bool):
+        return 0.0
+
     try:
-        return float(result.get(key, 0.0))
+        score = float(value)
     except (TypeError, ValueError):
         return 0.0
 
+    if not 0.0 <= score <= 1.0:
+        return 0.0
+
+    return score
+
 
 def _get_label(result: Dict[str, Any]) -> str:
-    """
-    Safely extract the evaluator's correctness label.
-    """
-    return str(result.get("label", "Ambiguous")).strip().lower()
+    """Safely extract the evaluator label."""
 
+    return str(
+        result.get("label", "Ambiguous")
+    ).strip().lower()
+
+
+def _is_valid_result(result: Any) -> bool:
+    """Exclude malformed results and evaluator failures."""
+
+    if not isinstance(result, dict):
+        return False
+
+    if _get_label(result) not in {
+        "correct",
+        "ambiguous",
+        "incorrect"
+    }:
+        return False
+
+    required_scores = [
+        "relevance",
+        "coverage",
+        "evidence_quality"
+    ]
+
+    for key in required_scores:
+        value = result.get(key)
+
+        if isinstance(value, bool):
+            return False
+
+        if not isinstance(value, (int, float)):
+            return False
+
+        if not 0.0 <= value <= 1.0:
+            return False
+
+    return True
+
+
+# -----------------------------
+# Evaluate evidence quality
+# -----------------------------
 
 def evaluate_evidence_quality(
     evaluation_results: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Summarize evaluator results and determine whether
-    retrieved evidence needs correction.
-
-    Expected result format:
-    [
-        {
-            "relevance": 0.8,
-            "coverage": 0.7,
-            "evidence_quality": 0.9,
-            "label": "Correct"
-        }
-    ]
+    Summarize evaluator results and determine
+    whether retrieved evidence needs correction.
     """
 
     if not evaluation_results:
@@ -55,14 +104,19 @@ def evaluate_evidence_quality(
             "correct_count": 0,
             "ambiguous_count": 0,
             "incorrect_count": 0,
+            "evaluation_error_count": 0,
+            "total_evaluated": 0,
         }
 
     valid_results = [
         result
         for result in evaluation_results
-        if isinstance(result, dict)
-        and not result.get("error")
+        if _is_valid_result(result)
     ]
+
+    evaluation_error_count = (
+        len(evaluation_results) - len(valid_results)
+    )
 
     if not valid_results:
         return {
@@ -75,6 +129,8 @@ def evaluate_evidence_quality(
             "correct_count": 0,
             "ambiguous_count": 0,
             "incorrect_count": 0,
+            "evaluation_error_count": evaluation_error_count,
+            "total_evaluated": 0,
         }
 
     relevance_scores = [
@@ -93,15 +149,15 @@ def evaluate_evidence_quality(
     ]
 
     average_relevance = (
-        sum(relevance_scores) / len(relevance_scores)
+        sum(relevance_scores) / len(valid_results)
     )
 
     average_coverage = (
-        sum(coverage_scores) / len(coverage_scores)
+        sum(coverage_scores) / len(valid_results)
     )
 
     average_evidence_quality = (
-        sum(evidence_scores) / len(evidence_scores)
+        sum(evidence_scores) / len(valid_results)
     )
 
     correct_count = sum(
@@ -119,24 +175,35 @@ def evaluate_evidence_quality(
         if _get_label(result) == "incorrect"
     )
 
-    needs_correction = (
-        average_relevance < RELEVANCE_THRESHOLD
-        or average_coverage < COVERAGE_THRESHOLD
-        or average_evidence_quality < EVIDENCE_THRESHOLD
-        or correct_count == 0
-    )
+    # Check whether at least one document
+    # independently meets the evidence thresholds.
+    accepted_results = [
+        result
+        for result in valid_results
+        if (
+            _get_label(result) == "correct"
+            and _get_score(result, "relevance")
+                >= RELEVANCE_THRESHOLD
+            and _get_score(result, "coverage")
+                >= COVERAGE_THRESHOLD
+            and _get_score(result, "evidence_quality")
+                >= EVIDENCE_THRESHOLD
+        )
+    ]
+
+    needs_correction = len(accepted_results) == 0
 
     if needs_correction:
         status = "needs_correction"
         reason = (
-            "Retrieved evidence did not meet the configured "
-            "quality thresholds."
+            "No individual document met all configured "
+            "evidence thresholds."
         )
     else:
         status = "evidence_accepted"
         reason = (
-            "Retrieved evidence met the configured "
-            "quality thresholds."
+            "At least one document met all configured "
+            "evidence thresholds."
         )
 
     return {
@@ -151,24 +218,29 @@ def evaluate_evidence_quality(
         "correct_count": correct_count,
         "ambiguous_count": ambiguous_count,
         "incorrect_count": incorrect_count,
+        "evaluation_error_count": evaluation_error_count,
         "total_evaluated": len(valid_results),
     }
 
+
+# -----------------------------
+# Correct retrieval
+# -----------------------------
 
 def correct_retrieval(
     evaluation_results: List[Dict[str, Any]],
     retrieved_documents: List[Any],
 ) -> Dict[str, Any]:
     """
-    Filter retrieved documents using evaluator labels
-    and return a correction decision.
+    Filter retrieved documents using evaluator labels.
 
     This function does not perform another retrieval
-    or web search. It prepares the result for the next
-    C-RAG pipeline stage.
+    or web search.
     """
 
-    quality = evaluate_evidence_quality(evaluation_results)
+    quality = evaluate_evidence_quality(
+        evaluation_results
+    )
 
     if not retrieved_documents:
         return {
@@ -177,24 +249,35 @@ def correct_retrieval(
             "correction_action": "no_documents",
         }
 
-    # Match evaluator outputs to retrieved documents by index.
     corrected_documents = []
 
-    valid_results = [
-        result
-        for result in evaluation_results
-        if isinstance(result, dict)
-        and not result.get("error")
-    ]
-
+    # Keep evaluation results aligned with their original
+    # retrieved documents. Do not filter before pairing.
     for index, document in enumerate(retrieved_documents):
-        if index >= len(valid_results):
+
+        if index >= len(evaluation_results):
             continue
 
-        result = valid_results[index]
+        result = evaluation_results[index]
+
+        if not _is_valid_result(result):
+            continue
+
         label = _get_label(result)
 
-        if label == "correct":
+        relevance = _get_score(result, "relevance")
+        coverage = _get_score(result, "coverage")
+        evidence_quality = _get_score(
+            result,
+            "evidence_quality"
+        )
+
+        if (
+            label == "correct"
+            and relevance >= RELEVANCE_THRESHOLD
+            and coverage >= COVERAGE_THRESHOLD
+            and evidence_quality >= EVIDENCE_THRESHOLD
+        ):
             corrected_documents.append(document)
 
     if corrected_documents:
@@ -209,8 +292,12 @@ def correct_retrieval(
     }
 
 
+# -----------------------------
+# Standalone test
+# -----------------------------
+
 if __name__ == "__main__":
-    # Simple standalone test
+
     sample_evaluations = [
         {
             "relevance": 0.9,
@@ -224,9 +311,17 @@ if __name__ == "__main__":
             "evidence_quality": 0.8,
             "label": "Correct",
         },
+        {
+            "relevance": None,
+            "coverage": None,
+            "evidence_quality": None,
+            "label": "EvaluationError",
+        },
     ]
 
-    result = evaluate_evidence_quality(sample_evaluations)
+    result = evaluate_evidence_quality(
+        sample_evaluations
+    )
 
     print("\nCorrection Evaluation")
     print("-" * 40)
