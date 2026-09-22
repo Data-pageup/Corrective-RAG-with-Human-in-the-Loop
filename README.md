@@ -39,7 +39,6 @@ When private documents do not contain sufficient information, the system can ask
 
 ## Architecture
 
-![Corrective RAG with Human-in-the-Loop Architecture](docs/crag_architecture.png)
 
 The architecture follows a private-knowledge-first approach. Public web search is optional and should only proceed after the user approves it.
 
