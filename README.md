@@ -15,7 +15,8 @@ This project implements a **Corrective RAG (C-RAG)** workflow that evaluates ret
 
 When private documents do not contain sufficient information, the system can ask the user for permission to perform an external web search.
 
-![Uploading image.png…]()
+<img width="637" height="362" alt="image" src="https://github.com/user-attachments/assets/8e2458e4-7083-4a7b-b9c8-de268d19173f" />
+
 
 
 ### Key Features
