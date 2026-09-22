@@ -154,9 +154,24 @@ def evaluate_document(question, document):
 
         result = json.loads(raw_response)
 
+        # Validate response type first
         if not isinstance(result, dict):
             raise ValueError(
                 "Ollama response must be a JSON object"
+            )
+
+        # Validate exact JSON fields
+        expected_fields = {
+            "relevance",
+            "coverage",
+            "evidence_quality",
+            "reason"
+        }
+
+        if set(result.keys()) != expected_fields:
+            raise ValueError(
+                "Response must contain exactly: "
+                "relevance, coverage, evidence_quality, reason"
             )
 
         # Validate scores
@@ -175,7 +190,7 @@ def evaluate_document(question, document):
             "evidence_quality"
         )
 
-        reason = result.get("reason", "")
+        reason = result.get("reason")
 
         if not isinstance(reason, str):
             raise ValueError("reason must be a string")
@@ -188,14 +203,14 @@ def evaluate_document(question, document):
         )
 
         # Classify the document
-        if evidence_score >= 0.70 and coverage >= 0.60:
+        if relevance < 0.4 or coverage < 0.4:
+            label = "Incorrect"
+
+        elif evidence_score >= 0.70 and coverage >= 0.60:
             label = "Correct"
 
-        elif evidence_score >= 0.40:
-            label = "Ambiguous"
-
         else:
-            label = "Incorrect"
+            label = "Ambiguous"
 
         return {
             "label": label,
@@ -289,30 +304,19 @@ def summarize_evaluation(results):
         evidence_score = None
 
     else:
-        coverage = max(
-            result["coverage"]
-            for result in valid_results
+        # Select one document using coverage first,
+        # then evidence score as the tie-breaker.
+        best_result = max(
+            valid_results,
+            key=lambda result: (
+                result["coverage"],
+                result["evidence_score"]
+            )
         )
 
-        evidence_score = max(
-            result["evidence_score"]
-            for result in valid_results
-        )
-
-        if any(
-            result["label"] == "Correct"
-            for result in valid_results
-        ):
-            decision = "Correct"
-
-        elif any(
-            result["label"] == "Ambiguous"
-            for result in valid_results
-        ):
-            decision = "Ambiguous"
-
-        else:
-            decision = "Incorrect"
+        coverage = best_result["coverage"]
+        evidence_score = best_result["evidence_score"]
+        decision = best_result["label"]
 
     return {
         "decision": decision,

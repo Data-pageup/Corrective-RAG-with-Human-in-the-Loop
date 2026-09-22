@@ -99,26 +99,27 @@ def get_embeddings():
 # 4. Create / load ChromaDB
 # -----------------------------
 
+
 def create_vector_store(chunks, embeddings):
-    """Create or load the persistent ChromaDB collection."""
+    # Recreate the collection so it always matches the
+    # freshly generated chunks used by BM25.
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+        print("Deleted existing ChromaDB collection.")
+    except Exception:
+        pass
 
     vector_store = Chroma(
+        client=client,
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
-        persist_directory=str(CHROMA_DIR)
     )
 
-    # Add chunks only when the collection is empty.
-    collection = vector_store._collection
+    vector_store.add_documents(chunks)
 
-    if collection.count() == 0:
-        vector_store.add_documents(chunks)
-        print(f"Stored {len(chunks)} chunks in ChromaDB.")
-    else:
-        print(
-            f"Loaded existing ChromaDB collection "
-            f"with {collection.count()} chunks."
-        )
+    print(f"Stored {len(chunks)} fresh chunks in ChromaDB.")
 
     return vector_store
 
@@ -175,29 +176,20 @@ def bm25_search(bm25_index, chunks, query, top_k=TOP_K):
 # 6. Reciprocal Rank Fusion
 # -----------------------------
 
-def reciprocal_rank_fusion(
-    bm25_results,
-    vector_results,
-    top_k=TOP_K
-):
-    """Combine BM25 and vector rankings using RRF."""
 
+def reciprocal_rank_fusion(bm25_results, vector_results, top_k=TOP_K):
     scores = {}
     documents = {}
 
-    result_lists = [
-        bm25_results,
-        vector_results
-    ]
+    result_lists = [bm25_results, vector_results]
 
     for result_list in result_lists:
         for rank, doc in enumerate(result_list, start=1):
 
-            # Use content + metadata to identify the same chunk.
             key = (
-                doc.page_content,
                 doc.metadata.get("source"),
-                doc.metadata.get("page")
+                doc.metadata.get("page"),
+                doc.page_content
             )
 
             scores[key] = scores.get(key, 0) + (
